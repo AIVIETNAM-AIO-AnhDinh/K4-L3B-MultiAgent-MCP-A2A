@@ -28,6 +28,8 @@ dist/*
 !dist/.gitkeep
 *.zip
 *.log
+debug/
+tool-schemas.json
 
 # Editors and operating systems
 .idea/

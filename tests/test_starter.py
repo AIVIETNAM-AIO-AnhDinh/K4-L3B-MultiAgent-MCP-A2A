@@ -7,7 +7,7 @@ import pytest
 
 from student_agent import OUTPUT_SCHEMA_VERSION, VARIANT_ID
 from student_agent.cases import CaseSet, load_case_set
-from student_agent.contracts import Contracts
+from student_agent.contracts import ContractError, Contracts
 from student_agent.submission import build_manifest
 
 
@@ -45,3 +45,8 @@ def test_generated_manifest_matches_public_contract() -> None:
     manifest = build_manifest(case_set)
     contracts.validate_manifest(manifest)
     assert manifest["output_schema_version"] == OUTPUT_SCHEMA_VERSION
+
+
+def test_contract_registry_rejects_missing_public_schemas(tmp_path: Path) -> None:
+    with pytest.raises(ContractError, match="missing public contracts"):
+        Contracts(tmp_path)

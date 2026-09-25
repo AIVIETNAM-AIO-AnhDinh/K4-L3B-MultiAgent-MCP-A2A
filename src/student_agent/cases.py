@@ -29,8 +29,25 @@ def _object(path: Path) -> dict[str, Any]:
     return value
 
 
-def load_case_set(root: Path, expected_count: int = 100) -> CaseSet:
+def locate_input_root(root: Path) -> Path:
+    """Return the directory holding case-set.json.
+
+    The release ZIP may be unzipped at the repo root (documented layout) or kept in its own
+    folder such as ``inputs/l3b-inputs-v1/``. Exactly one candidate must exist.
+    """
     root = root.resolve()
+    if (root / "case-set.json").is_file():
+        return root
+    nested = sorted(path.parent for path in (root / "inputs").glob("*/case-set.json"))
+    if len(nested) == 1:
+        return nested[0]
+    if len(nested) > 1:
+        raise ValueError(f"multiple case sets found: {[str(p) for p in nested]}")
+    raise ValueError(f"{root}/case-set.json not found (unzip the L3B inputs first)")
+
+
+def load_case_set(root: Path, expected_count: int = 100) -> CaseSet:
+    root = locate_input_root(root)
     manifest = _object(root / "case-set.json")
     if set(manifest) != {"case_set_version", "variant_id", "case_ids"}:
         raise ValueError("case-set.json has unexpected or missing fields")
