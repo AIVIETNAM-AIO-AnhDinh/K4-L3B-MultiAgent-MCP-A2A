@@ -178,16 +178,16 @@ Không đưa source, input, `.env`, API key hoặc debug log vào ZIP. Sau đó 
 
 ## Tiêu chí chấm điểm công khai
 
-| Thành phần                                     | Trọng số |
-| ---------------------------------------------- | -------: |
-| Độ đúng nghiệp vụ (`semantic`)                 |      40% |
-| Chất lượng bằng chứng (`evidence`)             |      15% |
-| Evidence đúng MCP audit (`provenance`)         |      15% |
-| Tính nhất quán giữa các field (`consistency`)  |      10% |
-| Đúng JSON Schema (`schema`)                    |       5% |
-| Confidence hợp lý (`calibration`)              |       5% |
-| Quy trình multi-agent trong trace (`workflow`) |       5% |
-| Hiệu quả gọi tool (`efficiency`)               |       5% |
+| Thành phần                                         | Trọng số |
+| ---------------------------------------------------- | ---------: |
+| Độ đúng nghiệp vụ (`semantic`)               |        40% |
+| Chất lượng bằng chứng (`evidence`)            |        15% |
+| Evidence đúng MCP audit (`provenance`)           |        15% |
+| Tính nhất quán giữa các field (`consistency`) |        10% |
+| Đúng JSON Schema (`schema`)                      |         5% |
+| Confidence hợp lý (`calibration`)                |         5% |
+| Quy trình multi-agent trong trace (`workflow`)    |         5% |
+| Hiệu quả gọi tool (`efficiency`)                |         5% |
 
 Case có thể nhận 0 điểm nếu:
 

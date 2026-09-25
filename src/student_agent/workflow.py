@@ -14,6 +14,7 @@ from .agents.ledger import DEFAULT_CALL_BUDGET
 from .mcp_gateway import EvidenceGateway, ToolSpec
 from .trace import TraceWriter
 
+
 EvidenceSink = Callable[[str, str, dict[str, Any], dict[str, Any] | None], None]
 _sink: EvidenceSink | None = None
 
@@ -36,6 +37,7 @@ def _budget() -> int:
         return max(1, int(os.getenv("DAY09_CALL_BUDGET", DEFAULT_CALL_BUDGET)))
     except ValueError:
         return DEFAULT_CALL_BUDGET
+
 
 
 async def solve_case(
