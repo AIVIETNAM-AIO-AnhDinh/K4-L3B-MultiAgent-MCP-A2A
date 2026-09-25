@@ -12,24 +12,54 @@ from .contracts import Contracts
 from .mcp_gateway import connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
-from .workflow import solve_case
+from .workflow import set_evidence_sink, solve_case
 
 
 def _root(value: str) -> Path:
     return Path(value).resolve()
 
 
-async def _show_tools(root: Path) -> None:
+async def _show_tools(root: Path, verbose: bool) -> None:
+    """Discovery only: list_tools is not a case-scoped tool call, so nothing is audited."""
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        for tool in await gateway.list_tools():
-            print(tool)
+        if not verbose:
+            for tool in await gateway.list_tools():
+                print(tool)
+            return
+        specs = await gateway.describe_tools()
+        print(
+            json.dumps(
+                [specs[name].as_dict() for name in sorted(specs)], ensure_ascii=False, indent=2
+            )
+        )
 
 
-async def _run(root: Path) -> None:
+def _evidence_dumper(directory: Path):
+    """Write raw MCP envelopes to a local, git-ignored debug folder (never packaged)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for stale in directory.glob("*.jsonl"):
+        stale.unlink()
+
+    def sink(case_id: str, tool: str, arguments: dict, envelope: dict | None) -> None:
+        record = {"tool": tool, "arguments": arguments, "envelope": envelope}
+        with (directory / f"{case_id}.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return sink
+
+
+async def _run(root: Path, only: list[str] | None = None, dump: Path | None = None) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
+    case_ids = list(case_set.case_ids)
+    if only:
+        unknown = sorted(set(only) - set(case_ids))
+        if unknown:
+            raise ValueError(f"unknown case ids: {unknown}")
+        case_ids = [case_id for case_id in case_ids if case_id in set(only)]
+    set_evidence_sink(_evidence_dumper(dump) if dump else None)
     contracts = Contracts(root / "contracts" / "schemas")
     output_root = root / "outputs"
     trace_path = root / "traces" / "trace.jsonl"
@@ -44,7 +74,7 @@ async def _run(root: Path) -> None:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
+        for case_id in case_ids:
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
             output = await solve_case(case, gateway, trace)
@@ -65,8 +95,19 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--root", default=".", help="repository root (default: current directory)")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
-    commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    tools = commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
+    tools.add_argument(
+        "--schema", action="store_true", help="print description + input/output schema as JSON"
+    )
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument(
+        "--case", action="append", dest="cases", metavar="CASE_ID",
+        help="debug: run only these case(s); the result is NOT a complete submission",
+    )
+    run.add_argument(
+        "--dump-evidence", nargs="?", const="debug/evidence", default=None, metavar="DIR",
+        help="debug: save raw MCP envelopes per case (default dir: debug/evidence)",
+    )
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -84,9 +125,11 @@ def main() -> None:
                 f"{len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
-            asyncio.run(_show_tools(root))
+            asyncio.run(_show_tools(root, args.schema))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(
+                _run(root, args.cases, root / args.dump_evidence if args.dump_evidence else None)
+            )
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")

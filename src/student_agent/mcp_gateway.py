@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx2
@@ -16,18 +17,70 @@ class MCPToolError(RuntimeError):
     """The gateway reached MCP, but the requested tool rejected the call."""
 
 
+@dataclass(frozen=True)
+class ToolSpec:
+    """Discovered MCP tool contract. Discovery is the only source of tool names/arguments."""
+
+    name: str
+    description: str = ""
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    output_schema: dict[str, Any] | None = None
+
+    @property
+    def properties(self) -> frozenset[str]:
+        props = self.input_schema.get("properties")
+        return frozenset(props) if isinstance(props, dict) else frozenset()
+
+    @property
+    def required(self) -> frozenset[str]:
+        required = self.input_schema.get("required")
+        return frozenset(r for r in required if isinstance(r, str)) if isinstance(
+            required, list
+        ) else frozenset()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self.input_schema,
+            "output_schema": self.output_schema,
+        }
+
+
+def _spec_from_tool(tool: Any) -> ToolSpec:
+    input_schema = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None)
+    output_schema = getattr(tool, "output_schema", None) or getattr(tool, "outputSchema", None)
+    return ToolSpec(
+        name=str(tool.name),
+        description=str(getattr(tool, "description", "") or ""),
+        input_schema=dict(input_schema) if isinstance(input_schema, dict) else {},
+        output_schema=dict(output_schema) if isinstance(output_schema, dict) else None,
+    )
+
+
 class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
         self._tool_names: tuple[str, ...] | None = None
+        self._specs: dict[str, ToolSpec] = {}
+
+    async def _discover(self) -> None:
+        response = await self._session.list_tools()
+        specs = [_spec_from_tool(tool) for tool in response.tools]
+        self._specs = {spec.name: spec for spec in specs}
+        self._tool_names = tuple(sorted(self._specs))
 
     async def list_tools(self) -> list[str]:
-        if self._tool_names is not None:
-            return list(self._tool_names)
-        response = await self._session.list_tools()
-        self._tool_names = tuple(sorted(tool.name for tool in response.tools))
-        return list(self._tool_names)
+        """Discovery runs once per gateway (not per case) and is cached."""
+        if self._tool_names is None:
+            await self._discover()
+        return list(self._tool_names or ())
+
+    async def describe_tools(self) -> dict[str, ToolSpec]:
+        if self._tool_names is None:
+            await self._discover()
+        return dict(self._specs)
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: Any) -> dict[str, Any]:
         if self._tool_names is not None and tool_name not in self._tool_names:

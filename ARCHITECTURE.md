@@ -1,137 +1,148 @@
 # L3B Architecture Record
 
 Tài liệu này mô tả các quyết định có thể kiểm chứng của implementation trong
-`src/student_agent/workflow.py`. Trace chỉ chứa sự kiện observable; không ghi prompt,
-chain-of-thought, API key hay payload nhạy cảm.
+`src/student_agent/agents/` (entry point `workflow.solve_case`). Trace chỉ chứa sự kiện
+observable; không ghi prompt, chain-of-thought, API key hay payload nhạy cảm.
 
 ## 1. System overview
 
 ```text
-                             ┌──────────────────────┐
-Input ──────────────────────▶│ Coordinator / Router │
-                             └──────────┬───────────┘
-                                        │ task_assigned
-                 ┌──────────────────────┼──────────────────────┐
-                 ▼                      ▼                      ▼
-       Entity/Customer Agent    Order/Item Agent        Shipment Agent
-                 │                      │                      │
-                 └──────────────┬───────┴──────────────┬───────┘
-                                ▼                      ▼
-                     Payment/Refund Agent        Policy Agent
-                                │                      │
-                                └──────────┬───────────┘
-                                           ▼
-                                Conflict Resolver
-                                           │
-                                           ▼
-                                    Verifier Agent
-                                           │ validated output
-                                           ▼
-                                         END
-
-Mỗi tool call đi qua case-scoped `EvidenceLedger`: discovery allow-list → cache →
-timeout/retry → schema validation tại `EvidenceGateway` → `tool_result_consumed`.
-Coordinator là agent duy nhất xây output; specialist chỉ trả facts và evidence refs.
+Input ─▶ Coordinator ──task_assigned──▶ Entity/Customer Agent ──handoff──▶ Coordinator
+              │                          (get_order, get_customer_history)
+              │  plan theo claimed issue (bounded DAG, ≤ 8 hops)
+              ├──▶ Order/Item Agent      (get_order_items [+ product/seller khi cần])
+              ├──▶ Shipment Agent        (get_shipment_summary)
+              ├──▶ Payment/Refund Agent  (get_payment_timeline [+ payments/refund khi cần])
+              │        ▼
+              │   Verifier: assess_issue (claim vs evidence, không gọi tool)
+              ├──▶ Policy Agent ─policy_decided─▶ (get_policy → rule + refund basis)
+              ▼
+         build draft ──task_assigned──▶ Verifier Agent ──verification_completed──▶ output
 ```
+
+Mọi tool call đi qua `EvidenceLedger` của đúng case: permission → discovered schema
+(argument mapping) → cache → budget → timeout/retry → envelope schema validation tại
+`EvidenceGateway` → `tool_result_consumed`. Coordinator là thành phần duy nhất build
+output và không tự gọi domain tool; specialist chỉ trả facts, evidence refs và conflicts.
+
+Source layout:
+
+| File | Vai trò |
+| --- | --- |
+| `mcp_gateway.py` | MCP session, `ToolSpec` discovery (name/description/input/output schema), envelope validation |
+| `agents/ledger.py` | case-scoped cache, permission, arg mapping, budget, retry, provenance |
+| `agents/a2a.py` | `A2ATask` / `A2AResult` envelope (`day09-a2a-v1`) |
+| `agents/entity.py`, `order_item.py`, `shipment.py`, `payment.py`, `policy.py` | specialists |
+| `agents/verifier.py` | `assess_issue` (independent claim check) + `verify` (invariants/repairs) |
+| `agents/coordinator.py` | planning, dispatch, merge conflicts, build output |
+| `agents/parsing.py` | defensive readers (Olist column names + synonyms, time window) |
 
 ## 2. Agent ownership
 
 | Actor | Input | Trách nhiệm | Tool permission | Output/handoff |
 | --- | --- | --- | --- | --- |
-| Entity/customer | case, claimed ID, candidates, customer hint | Reject marker/invalid candidate, resolve order qua MCP, lấy customer history | `get_order`, `get_customer_history` | resolution status, selected order, related orders |
-| Coordinator | case và specialist results | Route bounded DAG, tổng hợp output, không tự tạo evidence | Không gọi domain tool trực tiếp | assignments, handoffs, draft output |
-| Order/item | resolved order | Thu item/product/seller IDs và context | `get_order_items`, `get_product_context`, `get_sellers` | entity facts + refs |
-| Shipment | resolved order | Phân loại timeline, seller/logistics delay | `get_shipment_summary` | shipment verdict + refs |
-| Payment/refund | resolved order, issue | Đối soát capture/refund theo case time window | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` | totals/verdict + refs |
-| Policy | policy version, classified issue | Chọn published rule cho status, action, refund, responsibility | `get_policy` | policy decision + ref |
-| Conflict resolver | facts, `opened_at`, source refs | Chọn record gần case time; event ưu tiên snapshot | Không gọi tool | `data_conflicts`, selected facts |
-| Verifier | complete draft + ledger | Check provenance, totals, entity/status/confidence invariants | Không gọi tool | `VERIFIED` hoặc fail closed |
+| Coordinator | case | Plan theo claimed issue, dispatch A2A, merge, build output | Không | draft output |
+| Entity/customer | claimed ID, candidates, hint, `opened_at` | Reject marker local, xác nhận order qua MCP, narrow candidate bằng customer history, chọn snapshot gần case time | `get_order`, `get_customer_history` | status, selected order, related orders, conflicts |
+| Order/item | order ID, nhu cầu | Item/seller/product IDs, price/freight totals, shipping limit | `get_order_items`, `get_sellers`, `get_product_context` | item facts |
+| Shipment | order, shipping limits | Late? (delivered vs estimated), attribution (event actor > carrier handoff vs shipping limit), lost/returned | `get_shipment_summary` | verdict, attribution, conflicts |
+| Payment/refund | order, expected total | Capture từ timeline (authoritative, lọc decoy), snapshot đối chiếu, duplicate/mismatch, trạng thái refund cuối cùng | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` | totals, verdict, conflicts |
+| Policy | issue, facts | Tìm rule của issue trong published policy, suy ra status/actions/basis/parties; default chỉ lấp field thiếu (ghi `fallback_fields`) | `get_policy` | decision + refund amount |
+| Verifier | draft + ledger + facts | Claim support, provenance, money cap, seller IDs, consistency | Không | repairs / degrade |
 
-Tool discovery tạo allow-list nhưng không mở rộng permission trong bảng. Ledger nhận actor
-ở mỗi call để permission và provenance có thể audit từ source/trace.
+Discovery chỉ có thể *thu hẹp* permission (tool không có trên server → không gọi), không
+bao giờ mở rộng. Ledger raise `PermissionError` nếu actor gọi tool ngoài bảng.
 
 ## 3. Entity resolution và A2A protocol
 
-Logical A2A envelope (nội bộ, không serialize vào trace):
+Envelope nội bộ (không serialize vào trace):
 
 ```json
-{
-  "protocol": "day09-a2a-v1",
-  "case_id": "L3B_CASE_001",
-  "sender": "coordinator",
-  "recipient": "shipment-agent",
-  "task": "INVESTIGATE_SHIPMENT",
-  "hop": 1,
-  "payload": {"order_id": "..."},
-  "evidence_refs": []
-}
+{"protocol": "day09-a2a-v1", "case_id": "L3B_CASE_001", "sender": "coordinator",
+ "recipient": "shipment-agent", "task": "INVESTIGATE_SHIPMENT", "hop": 3,
+ "payload": {"order_id": "..."}}
 ```
 
-`case_id` là correlation/scope key bắt buộc. Workflow là DAG một chiều; specialist chỉ
-handoff về coordinator, không gọi lẫn nhau, nên không có vòng lặp. Mỗi task chạy tối đa
-một lần cho một `(tool, arguments)` nhờ cache. Claimed ID được ưu tiên; marker
-`candidate-*` và candidate sai định dạng không phải claimed ID bị reject tại chỗ để tránh
-call audit vô ích. Candidate opaque còn lại phải được `get_order` xác nhận. Một match là
-`resolved`, nhiều match là `ambiguous`, không match là `not_found`; chỉ entity resolved
-mới mở các domain investigation.
+`case_id` là correlation key; coordinator từ chối `A2AResult` có `case_id` khác. DAG một
+chiều, specialist chỉ handoff về coordinator, giới hạn 8 hop.
 
-## 4. Evidence và conflict lifecycle
+Entity resolution (tối thiểu call):
 
-1. Gateway nhận envelope và validate bằng `mcp-evidence-response-v1.schema.json`.
-2. Ledger chỉ sống trong một `solve_case`; cache key gồm tool + arguments, `case_id` được
-   truyền bắt buộc, nên evidence không thể tái sử dụng chéo case.
-3. Sau response hợp lệ, ledger lưu nguyên `evidence_ref` rồi emit
-   `tool_result_consumed`. Ref không bị sửa, hash lại hoặc tự sinh.
-4. Output-level refs là tập con duy nhất của ledger. Claim-level refs chỉ lấy domain liên
-   quan cộng policy.
-5. Với snapshot trùng/mâu thuẫn, record có business timestamp gần `opened_at` được chọn;
-   authoritative timeline event ưu tiên summary snapshot. Payment/refund chỉ cộng event
-   trong cửa sổ ±120 ngày quanh case để loại decoy lịch sử.
-6. Mỗi conflict observable được ghi vào `data_conflicts` với hai source, selected source
-   và resolution code. Nếu thiếu nguồn đủ mạnh thì verdict chuyển
-   `insufficient_evidence`, không nội suy dữ liệu.
+1. Candidate = claimed + `candidate_order_ids`, dedupe, tối đa 5. Marker `candidate-*` và
+   ID sai định dạng (không phải claimed) bị reject local, không tốn call.
+2. `get_order(claimed)`. `customer_unique_id` lấy từ order record (authoritative) trước hint.
+3. `get_customer_history` một lần. Candidate còn lại được lọc bằng history **miễn phí**;
+   chỉ candidate có trong history mới được `get_order`. Không có history → tối đa 3 lookup.
+4. Một match → `resolved`; nhiều → `ambiguous` (chọn theo case-time proximity, confidence
+   ≤ 0.55); không match → `not_found` → `insufficient_evidence`, dừng domain investigation.
 
-## 5. Failure and efficiency policy
+## 4. Investigation plan và evidence lifecycle
 
-| Failure | Retry budget | Fallback | Trace event/code |
+| Claimed issue | Tool calls (ngoài order + history + policy) |
+| --- | --- |
+| late_delivery_seller / logistics | items, shipment, payment_timeline |
+| canceled_order_paid, unsupported_claim | shipment, payment_timeline |
+| unavailable_order_paid | items (+ product_context), shipment, payment_timeline |
+| valid_split_payment, payment_mismatch | items, shipment, payment_timeline, order_payments |
+| duplicate_charge | shipment, payment_timeline, order_payments |
+| refund_pending / refund_failed | shipment, payment_timeline, refund_timeline |
+
+→ 5–7 audited calls/case (starter cũ: 9–10). `get_sellers` chỉ gọi khi item thiếu seller_id.
+
+1. Gateway validate envelope bằng `mcp-evidence-response-v1.schema.json`.
+2. Ledger sống trong một `solve_case`; cache key = tool + argument đã map theo schema.
+3. `evidence_ref` lưu nguyên văn, emit `tool_result_consumed` (actor = specialist gọi).
+4. Output refs ⊆ ledger; verifier loại mọi ref ngoài ledger. Chỉ gọi tool sẽ dùng, nên mọi
+   ref trong output đều là evidence đã dùng cho kết luận.
+5. Time window của event: `[purchase − 3 ngày, opened_at + 120 ngày]`; event mang `order_id`
+   khác bị loại (decoy). Timeline event ưu tiên hơn snapshot.
+6. Conflict được ghi vào `data_conflicts` (≤ 5, dedupe theo field):
+
+| Field | Sources | Selected | Code |
+| --- | --- | --- | --- |
+| `captured_total_brl` | order_payments vs payment_timeline | timeline | `AUTHORITATIVE_EVENT` |
+| `delivery_timeliness` | shipment summary vs events | events | `AUTHORITATIVE_EVENT` |
+| `delay_responsibility` | event actor vs handoff/limit | events | `AUTHORITATIVE_EVENT` |
+| `order_snapshot` | nhiều snapshot trong history | gần case time | `CASE_TIME_PROXIMITY` |
+| `order_status`, `customer_order_link` | get_order vs history | get_order | `ORDER_SYSTEM_OF_RECORD` |
+
+## 5. Issue decision, policy và money
+
+- Hypothesis = claim topic hợp lệ đầu tiên. `assess_issue` kiểm tra độc lập bằng evidence:
+  `supported` / `contradicted` (+ issue thay thế) / `unknown`.
+- `DAY09_ISSUE_MODE=claim` (mặc định): giữ topic, confidence 0.93 / 0.82 / 0.6.
+  `DAY09_ISSUE_MODE=evidence`: đổi sang issue evidence hỗ trợ khi bị contradicted.
+  Hai mode để A/B trên public leaderboard.
+- Refund basis từ policy (`freight`, `full`, `duplicate`, `difference`, `failed_refund`,
+  `none`, số cố định, ratio). Verifier cap refund ≤ captured − refunded theo timeline;
+  không có timeline capture → refund 0 ("chỉ refund khi timeline authoritative hỗ trợ").
+- `no_action` ⇒ refund 0; seller responsibility ⇒ mỗi seller có `party_id`.
+
+## 6. Failure and efficiency policy
+
+| Failure | Retry | Fallback | Observable |
 | --- | ---: | --- | --- |
-| MCP timeout/transport | 1 retry, 45 s/attempt | Mark tool unavailable for case, lower confidence | verifier attributes `mcp_failure_count` |
-| MCP tool rejection/not found | 0 retry | Reject entity or use insufficient evidence | `ENTITY_NOT_FOUND` / policy unavailable |
-| Entity ambiguous | 0 broad scan | Preserve all matched/rejected IDs, cap confidence 0.55 | `ENTITY_AMBIGUOUS` |
-| Source conflict | 0 extra query | Apply time/event precedence, expose conflict | `AUTHORITATIVE_EVENT` / `CASE_TIME_PROXIMITY` |
-| Invalid envelope/specialist result | 0 retry | Fail/degrade; never fabricate evidence | `VERIFICATION_FAILED` |
+| Timeout/transport | 1 (45 s/attempt) | tool unavailable cho case, confidence −0.05 | `mcp_failure_count` |
+| MCP business error / not found | 0 | reject entity / insufficient evidence | `ENTITY_NOT_FOUND` |
+| Tool không có trong discovery | 0 call | bỏ qua | `tool_not_discovered` |
+| Argument không map được theo schema | 0 call | bỏ qua | `argument_not_in_schema` |
+| Vượt call budget (`DAY09_CALL_BUDGET`, mặc định 10) | 0 call | degrade | `call_budget_exhausted` |
+| Verifier lỗi không repair được | — | `needs_investigation`, confidence ≤ 0.3 (vẫn ghi output) | `VERIFICATION_DEGRADED` |
 
-Efficiency controls: maximum five candidates; negative marker rejected locally; discovery
-cached per gateway; each exact call cached per case; base investigation calls each required
-tool once; refund timeline chỉ gọi cho refund issue. Retry chỉ áp dụng transport timeout và
-giữ nguyên idempotent arguments. MCP business error không retry.
+## 7. Verification invariants
 
-## 6. Verification invariants
+- output `case_id` đúng case; resolved phải có affected order;
+- mọi ref (output + claim) thuộc ledger case, không trùng, ≤ 30;
+- tổng `refund_lines` = `recommended_refund_brl`; không âm; ≤ refundable theo timeline;
+- `no_action` không đi kèm refund; actions không trùng;
+- confidence ∈ [0, 1], cap khi ambiguous / MCP failure;
+- CLI validate output bằng `l3b-output-v2.schema.json` trước atomic write.
 
-Trước finalize, verifier kiểm tra:
+## 8. Reproducibility & debug
 
-- output `case_id` và entity IDs thuộc case hiện tại; resolved phải có affected order;
-- mọi output ref thuộc ledger của case, không trùng; claim refs là domain-relevant;
-- tổng `refund_lines` bằng `recommended_refund_brl`, amount không âm;
-- `no_action` không đi kèm refund dương;
-- capture/refund lấy từ timeline window, policy quyết định refundable amount;
-- conflict có source precedence tường minh; seller responsibility bổ sung seller ID;
-- confidence nằm `[0, 1]` và bị cap khi entity ambiguous/missing tool;
-- output được CLI validate lần cuối bằng `l3b-output-v2.schema.json` trước atomic write.
-
-Verifier fail thì raise trước khi output được ghi. Trace `verification_completed` luôn chứa
-decision code và chỉ tối đa 20 evidence refs theo trace schema.
-
-## 7. Reproducibility
-
-- Runtime: Python 3.11+, dependency ranges được khóa trong `pyproject.toml`.
-- Framework: thuần Python async state machine; không model/LLM call và không randomness
-  nghiệp vụ. Chỉ `event_id` và timestamps của trace là nondeterministic.
-- Concurrency: một case và một MCP call tại một thời điểm để trace/order/audit ổn định.
-- Limits: 45 s mỗi attempt, tối đa hai attempts cho transient failure, năm candidates,
-  30 output refs, 20 trace refs.
-- Contract source of truth: bốn schema versioned trong `contracts/schemas/`; breaking
-  change phải tạo version mới, không đổi semantics file V1/V2 hiện tại.
-- Commands: `pytest -q`, `day09 run`, `day09 validate`,
-  `day09 package --output dist/submission.zip`.
-- Secrets chỉ đọc từ `.env`; không đi vào output, trace, manifest hay tài liệu này.
+- Python 3.11+, thuần async state machine, không LLM, không randomness nghiệp vụ.
+- Một case, một MCP call tại một thời điểm → trace/audit ổn định.
+- `day09 mcp-tools --schema`: in description + input/output schema (discovery, không audit per-case).
+- `day09 run --case L3B_CASE_001 --dump-evidence`: debug, lưu envelope thô vào `debug/evidence/`
+  (git-ignored, không vào ZIP). Lưu ý: call debug vẫn bị audit.
+- Input có thể ở root hoặc `inputs/<release>/` (tự dò `case-set.json`).
+- Commands: `pytest -q`, `day09 run`, `day09 validate`, `day09 package --output dist/submission.zip`.
