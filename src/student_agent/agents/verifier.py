@@ -16,6 +16,39 @@ from .parsing import CENT, money
 LATE_ISSUES = {"late_delivery_seller": "seller", "late_delivery_logistics": "logistics_provider"}
 
 
+def infer_issue_from_facts(facts: dict[str, Any]) -> str | None:
+    """Return a known issue directly supported by specialist facts, if one is clear."""
+    shipment = facts.get("shipment", {})
+    shipment_issue = {
+        "seller_delay": "late_delivery_seller",
+        "logistics_delay": "late_delivery_logistics",
+    }.get(shipment.get("verdict"))
+    if shipment_issue:
+        return shipment_issue
+
+    payment = facts.get("payment", {})
+    payment_issue = {
+        "capture_mismatch": "payment_mismatch",
+        "duplicate_capture": "duplicate_charge",
+        "refund_pending": "refund_pending",
+        "refund_failed": "refund_failed",
+    }.get(payment.get("verdict"))
+    if payment_issue:
+        return payment_issue
+
+    order = facts.get("order", {})
+    status = str(order.get("order_status") or order.get("status") or "").lower()
+    captured: Decimal = payment.get("captured") or Decimal(0)
+    if "cancel" in status and captured > 0:
+        return "canceled_order_paid"
+    product_status = " ".join(facts.get("items", {}).get("product_status", []))
+    if "unavailable" in product_status and captured > 0:
+        return "unavailable_order_paid"
+    if payment.get("verdict") == "reconciled" and payment.get("split"):
+        return "valid_split_payment"
+    return None
+
+
 def assess_issue(issue: str, facts: dict[str, Any]) -> tuple[str, str | None]:
     """Return (support, alternative_issue); support in supported|contradicted|unknown."""
     shipment = facts.get("shipment", {})

@@ -109,8 +109,8 @@ Entity resolution (tối thiểu call):
 
 - Hypothesis = claim topic hợp lệ đầu tiên. `assess_issue` kiểm tra độc lập bằng evidence:
   `supported` / `contradicted` (+ issue thay thế) / `unknown`.
-- `DAY09_ISSUE_MODE=claim` (mặc định): giữ topic, confidence 0.93 / 0.82 / 0.6.
-  `DAY09_ISSUE_MODE=evidence`: đổi sang issue evidence hỗ trợ khi bị contradicted.
+- `DAY09_ISSUE_MODE=claim` (mặc định): giữ topic trong claim, confidence 0.93 / 0.82 / 0.6.
+  `DAY09_ISSUE_MODE=evidence`: chế độ A/B đổi issue khi bị contradicted; issue thay thế nhận confidence 0.72.
   Hai mode để A/B trên public leaderboard.
 - Refund basis từ policy (`freight`, `full`, `duplicate`, `difference`, `failed_refund`,
   `none`, số cố định, ratio). Verifier cap refund ≤ captured − refunded theo timeline;

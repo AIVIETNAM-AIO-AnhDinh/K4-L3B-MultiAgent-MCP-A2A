@@ -18,7 +18,7 @@ from .parsing import money, pick, unique
 from .payment import PaymentRefundAgent
 from .policy import PolicyAgent
 from .shipment import ShipmentAgent
-from .verifier import assess_issue, verify
+from .verifier import assess_issue, infer_issue_from_facts, verify
 
 ACTOR = "coordinator"
 PRIMARY_ISSUES = {
@@ -34,8 +34,7 @@ ITEM_ISSUES = SHIPMENT_ISSUES | {"unavailable_order_paid", "valid_split_payment"
 
 
 def issue_mode() -> str:
-    """`claim` keeps the claimed topic (confidence reflects support);
-    `evidence` switches to the evidence-supported issue when the claim is contradicted."""
+    """`claim` preserves the better-scoring baseline; `evidence` is an A/B override."""
     mode = os.getenv("DAY09_ISSUE_MODE", "claim").strip().lower()
     return mode if mode in {"claim", "evidence"} else "claim"
 
@@ -136,8 +135,17 @@ class Coordinator:
         # independent verification of the claim before the policy is applied
         support, alternative = assess_issue(hypothesis, facts) if order_id else ("unknown", None)
         issue = hypothesis if order_id else "insufficient_evidence"
-        if order_id and support == "contradicted" and alternative and issue_mode() == "evidence":
-            issue = alternative
+        issue_support = support
+        if order_id and issue_mode() == "evidence":
+            inferred = infer_issue_from_facts(facts)
+            if support == "contradicted":
+                issue = (
+                    alternative if alternative not in (None, "unsupported_claim") else inferred
+                ) or alternative or "unsupported_claim"
+            elif hypothesis == "unsupported_claim" and inferred:
+                issue = inferred
+            if issue != hypothesis:
+                issue_support, _ = assess_issue(issue, facts)
 
         policy_facts = {**facts["payment"], **{
             k: facts["items"].get(k) for k in ("freight_total_brl", "items_total_brl")
@@ -147,10 +155,11 @@ class Coordinator:
         })
         if not policy.facts["found"] and issue != "insufficient_evidence":
             issue = "insufficient_evidence"
+            issue_support = "unknown"
             policy.facts.update(case_status="needs_investigation",
                                 actions=["manual_investigation"], refund_amount=Decimal(0))
 
-        output = self.build(case, facts, policy.facts, issue, hypothesis, support)
+        output = self.build(case, facts, policy.facts, issue, hypothesis, support, issue_support)
 
         self.ledger.trace.emit(
             case_id=self.case_id, event_type="task_assigned", actor=ACTOR,
@@ -177,7 +186,7 @@ class Coordinator:
     # ---- output ---------------------------------------------------------------------
     def build(
         self, case: dict[str, Any], facts: dict[str, Any], policy: dict[str, Any], issue: str,
-        hypothesis: str, support: str,
+        hypothesis: str, support: str, issue_support: str,
     ) -> dict[str, Any]:
         entity, items = facts["entity"], facts["items"]
         shipment, payment = facts["shipment"], facts["payment"]
@@ -200,7 +209,7 @@ class Coordinator:
         confidence -= min(0.2, 0.05 * len(self.ledger.failures))
         confidence = round(max(0.05, min(confidence, 0.99)), 2)
 
-        claims = self._claims(case, issue, support, refund, payment)
+        claims = self._claims(case, issue, issue_support, refund, payment)
         shipment_verdict = shipment.get("verdict", "insufficient_evidence")
         output = {
             "schema_version": "day09-l3b-output-v2",
