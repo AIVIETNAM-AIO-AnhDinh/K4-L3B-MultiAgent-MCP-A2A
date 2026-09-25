@@ -9,6 +9,14 @@ from referencing import Registry, Resource
 
 from . import VARIANT_ID
 
+PUBLIC_CONTRACT_IDS = {
+    "l3a-output-v2.schema.json": "https://day09.vinaction.local/contracts/l3a-output-v2.schema.json",
+    "l3b-output-v2.schema.json": "https://day09.vinaction.local/contracts/l3b-output-v2.schema.json",
+    "trace-event-v1.schema.json": "https://day09.vinaction.local/contracts/trace-event-v1.schema.json",
+    "submission-manifest-v2.schema.json": "https://day09.vinaction.local/contracts/submission-manifest-v2.schema.json",
+    "mcp-evidence-response-v1.schema.json": "https://day09.vinaction.local/contracts/mcp-evidence-response-v1.schema.json",
+}
+
 
 class ContractError(ValueError):
     pass
@@ -19,11 +27,27 @@ class Contracts:
         self.root = root.resolve()
         schemas: dict[str, dict[str, Any]] = {}
         registry = Registry()
+        seen_ids: set[str] = set()
         for path in sorted(self.root.glob("*.schema.json")):
             schema = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(schema, dict):
+                raise ContractError(f"{path.name}: schema must be a JSON object")
+            Draft202012Validator.check_schema(schema)
+            schema_id = schema.get("$id")
+            if not isinstance(schema_id, str) or not schema_id:
+                raise ContractError(f"{path.name}: schema must have a non-empty $id")
+            expected_id = PUBLIC_CONTRACT_IDS.get(path.name)
+            if expected_id is not None and schema_id != expected_id:
+                raise ContractError(f"{path.name}: public contract $id changed")
+            if schema_id in seen_ids:
+                raise ContractError(f"duplicate schema $id: {schema_id}")
+            seen_ids.add(schema_id)
             schemas[path.name] = schema
             resource = Resource.from_contents(schema)
-            registry = registry.with_resource(schema["$id"], resource)
+            registry = registry.with_resource(schema_id, resource)
+        missing = sorted(set(PUBLIC_CONTRACT_IDS) - set(schemas))
+        if missing:
+            raise ContractError(f"missing public contracts: {missing}")
         self._schemas = schemas
         self._registry = registry
 

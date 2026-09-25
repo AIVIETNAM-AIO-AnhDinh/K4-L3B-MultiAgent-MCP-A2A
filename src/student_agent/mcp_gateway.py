@@ -12,26 +12,42 @@ from mcp.client.streamable_http import streamable_http_client
 from .contracts import Contracts
 
 
+class MCPToolError(RuntimeError):
+    """The gateway reached MCP, but the requested tool rejected the call."""
+
+
 class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self._tool_names: tuple[str, ...] | None = None
 
     async def list_tools(self) -> list[str]:
+        if self._tool_names is not None:
+            return list(self._tool_names)
         response = await self._session.list_tools()
-        return sorted(tool.name for tool in response.tools)
+        self._tool_names = tuple(sorted(tool.name for tool in response.tools))
+        return list(self._tool_names)
 
-    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+    async def call(self, tool_name: str, *, case_id: str, **arguments: Any) -> dict[str, Any]:
+        if self._tool_names is not None and tool_name not in self._tool_names:
+            raise MCPToolError(f"MCP tool is not available: {tool_name}")
         payload = {"case_id": case_id, **arguments}
-        result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        try:
+            result = await self._session.call_tool(tool_name, arguments=payload)
+        except TimeoutError:
+            raise
+
+        # MCP SDK 1.x used camelCase aliases while 2.x exposes snake_case.
+        is_error = getattr(result, "is_error", getattr(result, "isError", False))
+        if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
-            raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
-        evidence = getattr(result, "structuredContent", None)
-        if evidence is None:
-            evidence = getattr(result, "structured_content", None)
+            raise MCPToolError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
+        evidence = getattr(result, "structured_content", None)
+        if evidence is None:  # compatibility with MCP SDK 1.x
+            evidence = getattr(result, "structuredContent", None)
         if evidence is None:
             text_blocks = [block.text for block in result.content if getattr(block, "text", None)]
             if len(text_blocks) != 1:
